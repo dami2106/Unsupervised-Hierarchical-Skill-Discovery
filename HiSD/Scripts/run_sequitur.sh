@@ -1,0 +1,1 @@
+python sequitur/sequitur.py --predicted-dir runs/stone_pick_static --dataset-dir ../Craftax/Traces/stone_pick_static
