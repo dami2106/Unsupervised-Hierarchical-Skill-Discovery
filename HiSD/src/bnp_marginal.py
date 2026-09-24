@@ -30,7 +30,7 @@ import torch
 
 class DPStickBreakingMarginal(torch.nn.Module):
     def __init__(self, k_max, gamma=1.0, prune_eps=None, gamma_prior=None, decay=0.99,
-                 warmup_updates=20, min_active=1):
+                 warmup_updates=20, min_active=1, prune_cooldown=5):
         super().__init__()
         self.k_max = k_max
         self.prune_eps = prune_eps if prune_eps is not None else 1. / (2. * k_max)
@@ -38,6 +38,7 @@ class DPStickBreakingMarginal(torch.nn.Module):
         self.decay = decay
         self.warmup_updates = warmup_updates
         self.min_active = min_active
+        self.prune_cooldown = prune_cooldown
         self.register_buffer('gamma', torch.tensor(float(gamma)))
         self.register_buffer('counts', torch.zeros(k_max))
         self.register_buffer('active', torch.ones(k_max, dtype=torch.bool))
@@ -46,6 +47,7 @@ class DPStickBreakingMarginal(torch.nn.Module):
         # running transport-cost gain of each prototype over its runner-up (DP-means pruning)
         self.register_buffer('red_sum', torch.zeros(k_max))
         self.register_buffer('red_cnt', torch.zeros(k_max))
+        self.register_buffer('last_prune', torch.tensor(-10 ** 9))
 
     @property
     def k_hat(self):
@@ -135,6 +137,8 @@ class DPStickBreakingMarginal(torch.nn.Module):
         (one per q-step so the survivors can re-absorb its frames)."""
         if self.n_updates.item() <= self.warmup_updates or self.k_hat <= self.min_active:
             return False
+        if self.n_updates.item() - self.last_prune.item() < self.prune_cooldown:
+            return False  # let the survivors re-absorb the pruned prototype's frames first
         mean_gain = torch.where(self.active & (self.red_cnt > 0), self.red_sum / self.red_cnt.clamp_min(1e-9),
                                 torch.full_like(self.red_sum, float('inf')))
         # a prototype that owns no frames at all is redundant too
@@ -144,8 +148,10 @@ class DPStickBreakingMarginal(torch.nn.Module):
             return False
         self.active[k] = False
         self.counts[k] = 0.
-        self.red_sum[k] = 0.
-        self.red_cnt[k] = 0.
+        # the survivors' gains change once k's frames move to them: restart the statistics
+        self.red_sum.zero_()
+        self.red_cnt.zero_()
+        self.last_prune.fill_(int(self.n_updates.item()))
         q = self.stick_weights()
         self.q.copy_(q / q.sum())
         return True

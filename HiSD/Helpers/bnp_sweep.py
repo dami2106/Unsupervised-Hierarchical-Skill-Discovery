@@ -86,6 +86,11 @@ def base_extra(args):
             'batch-size': args.batch_size, 'val-freq': 1000}
 
 
+def merged(params, extra):
+    # frozen params may carry their own batch size / layers; they take precedence over CLI defaults
+    return {**extra, **params} if params else extra
+
+
 def tune(args):
     import optuna
     out = Path(args.out)
@@ -133,7 +138,7 @@ def sweep(args):
 
     def work(job):
         tag, extra = job
-        m = run_train(params, {**base_extra(args), **extra})
+        m = run_train({}, {**merged(params, base_extra(args)), **extra})
         row = {**tag, **m}
         print(row, flush=True)
         if m:
@@ -168,7 +173,7 @@ def main():
     p.add_argument('--k-gt', type=int, default=2)
     p.add_argument('--trials', type=int, default=40)
     p.add_argument('--params', type=str, default=None, help='frozen best_params.json from tune')
-    p.add_argument('--ks', nargs='+', type=int, default=[2, 3, 4])
+    p.add_argument('--ks', nargs='*', type=int, default=[2, 3, 4])
     p.add_argument('--kmaxes', nargs='+', type=int, default=[4, 8])
     p.add_argument('--gammas', nargs='+', type=float, default=[1.0])
     p.add_argument('--usages', nargs='+', default=['plan'])
