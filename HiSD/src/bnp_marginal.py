@@ -43,6 +43,9 @@ class DPStickBreakingMarginal(torch.nn.Module):
         self.register_buffer('active', torch.ones(k_max, dtype=torch.bool))
         self.register_buffer('n_updates', torch.tensor(0))
         self.register_buffer('q', torch.full((k_max,), 1. / k_max))
+        # running transport-cost gain of each prototype over its runner-up (DP-means pruning)
+        self.register_buffer('red_sum', torch.zeros(k_max))
+        self.register_buffer('red_cnt', torch.zeros(k_max))
 
     @property
     def k_hat(self):
@@ -117,6 +120,35 @@ class DPStickBreakingMarginal(torch.nn.Module):
                 q = self.stick_weights()
         self.q.copy_(q / q.sum())
         return self.q
+
+    @torch.no_grad()
+    def accumulate_redundancy(self, sums, cnts):
+        """Running (decayed) per-prototype transport-cost gain over the runner-up prototype."""
+        if sums is None:
+            return
+        self.red_sum.mul_(self.decay).add_(sums.to(self.counts.device))
+        self.red_cnt.mul_(self.decay).add_(cnts.to(self.counts.device))
+
+    @torch.no_grad()
+    def prune_redundant(self, delta):
+        """Prune the most redundant active prototype if its mean cost gain is below delta
+        (one per q-step so the survivors can re-absorb its frames)."""
+        if self.n_updates.item() <= self.warmup_updates or self.k_hat <= self.min_active:
+            return False
+        mean_gain = torch.where(self.active & (self.red_cnt > 0), self.red_sum / self.red_cnt.clamp_min(1e-9),
+                                torch.full_like(self.red_sum, float('inf')))
+        # a prototype that owns no frames at all is redundant too
+        mean_gain = torch.where(self.active & (self.red_cnt <= 1e-6), torch.zeros_like(mean_gain), mean_gain)
+        k = int(torch.argmin(mean_gain).item())
+        if mean_gain[k] >= delta:
+            return False
+        self.active[k] = False
+        self.counts[k] = 0.
+        self.red_sum[k] = 0.
+        self.red_cnt[k] = 0.
+        q = self.stick_weights()
+        self.q.copy_(q / q.sum())
+        return True
 
     @torch.no_grad()
     def merge_similar(self, prototypes, cos_thresh):

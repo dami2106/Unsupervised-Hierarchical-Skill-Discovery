@@ -64,8 +64,20 @@ def suggest(trial):
         'ub-actions': trial.suggest_categorical('ub-actions', [True, False]),
         'std-feats': trial.suggest_categorical('std-feats', [True, False]),
         'rho': trial.suggest_float('rho', 0.0, 0.3, step=0.001),
-        'n-frames': trial.suggest_int('n-frames', 10, 40, step=2),
+        'n-frames': trial.suggest_int('n-frames', 10, 80, step=2),
     }
+
+
+ENQUEUE = [
+    {'alpha-train': 0.11, 'alpha-eval': 0.14, 'lambda-frames-train': 0.1, 'lambda-actions-train': 0.1,
+     'lambda-frames-eval': 0.03, 'lambda-actions-eval': 0.1, 'eps-train': 0.022, 'eps-eval': 0.382,
+     'radius-gw': 0.098, 'learning-rate': 1e-5, 'weight-decay': 1e-3, 'n-epochs': 30, 'ub-frames': False,
+     'ub-actions': False, 'std-feats': True, 'rho': 0.182, 'n-frames': 80},
+    {'alpha-train': 0.3, 'alpha-eval': 0.3, 'lambda-frames-train': 0.05, 'lambda-actions-train': 0.05,
+     'lambda-frames-eval': 0.05, 'lambda-actions-eval': 0.01, 'eps-train': 0.07, 'eps-eval': 0.04,
+     'radius-gw': 0.04, 'learning-rate': 1e-3, 'weight-decay': 1e-4, 'n-epochs': 20, 'ub-frames': False,
+     'ub-actions': False, 'std-feats': True, 'rho': 0.1, 'n-frames': 40},
+]
 
 
 def base_extra(args):
@@ -78,6 +90,8 @@ def tune(args):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=0))
+    for seed_cfg in ENQUEUE:  # known-reasonable starting points (the paper's stone-pickaxe config, ASOT defaults)
+        study.enqueue_trial(seed_cfg)
 
     def objective(trial):
         m = run_train(suggest(trial), {**base_extra(args), 'n-clusters': args.k_gt, 'seed': 0})
@@ -101,7 +115,8 @@ def sweep(args):
     for (kmax, gamma, usage), seed in itertools.product(
             itertools.product(args.kmaxes, args.gammas, args.usages), args.seeds):
         extra = {'n-clusters': kmax, 'marginal': 'dp', 'dp-gamma': gamma, 'dp-usage': usage,
-                 'dp-warmup': args.dp_warmup, 'dp-decay': args.dp_decay, 'seed': seed}
+                 'dp-warmup': args.dp_warmup, 'dp-warmup-frac': args.dp_warmup_frac, 'dp-decay': args.dp_decay,
+                 'dp-merge-delta': args.dp_merge_delta, 'seed': seed}
         if args.gamma_prior:
             extra['dp-gamma-prior'] = args.gamma_prior
         jobs.append(({'config': f'dp_g{gamma}_{usage}', 'K': kmax, 'seed': seed}, extra))
@@ -145,7 +160,9 @@ def main():
     p.add_argument('--gammas', nargs='+', type=float, default=[1.0])
     p.add_argument('--usages', nargs='+', default=['plan'])
     p.add_argument('--gamma-prior', nargs=2, type=float, default=None)
-    p.add_argument('--dp-warmup', type=int, default=20)
+    p.add_argument('--dp-warmup', type=int, default=None)
+    p.add_argument('--dp-warmup-frac', type=float, default=0.5)
+    p.add_argument('--dp-merge-delta', type=float, default=0.1)
     p.add_argument('--dp-decay', type=float, default=0.99)
     p.add_argument('--seeds', nargs='+', type=int, default=[0, 1, 2, 3, 4])
     args = p.parse_args()

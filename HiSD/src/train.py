@@ -37,7 +37,8 @@ class VideoSSL(pl.LightningModule):
                  lambda_frames_train=0.05, lambda_actions_train=0.05, lambda_frames_eval=0.05, lambda_actions_eval=0.01,
                  temp=0.1, radius_gw=0.04, learn_clusters=True, n_frames=256, rho=0.1, visualize=False,
                  marginal='uniform', dp_gamma=1.0, dp_prune_eps=None, dp_gamma_prior=None, dp_decay=0.99,
-                 dp_warmup=20, dp_usage='plan', dp_usage_lambda=0.01, dp_merge_cos=None, n_gt_skills=None):
+                 dp_warmup=20, dp_usage='plan', dp_usage_lambda=0.01, dp_merge_cos=None, dp_merge_delta=0.1,
+                 dp_train_marginal='uniform', n_gt_skills=None):
         super().__init__()
         self.lr = lr
         self.weight_decay = weight_decay
@@ -82,6 +83,8 @@ class VideoSSL(pl.LightningModule):
         self.dp_usage = dp_usage
         self.dp_usage_lambda = dp_usage_lambda
         self.dp_merge_cos = dp_merge_cos
+        self.dp_merge_delta = dp_merge_delta
+        self.dp_train_marginal = dp_train_marginal
         self.n_gt_skills = n_gt_skills
         if marginal == 'dp':
             self.dp = DPStickBreakingMarginal(n_clusters, gamma=dp_gamma, prune_eps=dp_prune_eps,
@@ -134,7 +137,10 @@ class VideoSSL(pl.LightningModule):
         k_act = len(idx)
         cost_matrix = 1. - features @ self.clusters[idx].T.unsqueeze(0)
         cost_matrix = cost_matrix + asot.temporal_prior(T, k_act, self.rho, features.device)
-        q = None if self.dp is None else self.dp.q[idx]
+        # Training keeps equipartition over the *active* prototypes unless dp_train_marginal='learned':
+        # feeding a learned marginal back into self-labelled representation learning invites collapse.
+        use_learned = self.dp is not None and (not train or relax_actions or self.dp_train_marginal == 'learned')
+        q = self.dp.q[idx] if use_learned else None
         if train:
             kw = dict(eps=self.train_eps, alpha=self.alpha_train, lambda_frames=self.lambda_frames_train,
                       lambda_actions=self.lambda_actions_train, n_iters=self.n_ot_train)
@@ -150,6 +156,25 @@ class VideoSSL(pl.LightningModule):
         plan = torch.zeros(B, T, self.n_clusters, device=features.device, dtype=plan_act.dtype)
         plan[:, :, idx] = plan_act
         return plan
+
+    @torch.no_grad()
+    def redundancy(self, features, mask):
+        """Per-prototype transport-cost increase if its frames were given to the runner-up prototype.
+
+        Small-variance (DP-means) view of the DP: a prototype is worth keeping only if it lowers the
+        transport cost of its frames by more than a penalty.  Returns (sum of increases, #frames)."""
+        idx = self.active_clusters()
+        if len(idx) < 2:
+            return None, None
+        cost = 1. - features @ self.clusters[idx].T.unsqueeze(0)  # (B, T, K_act)
+        cost = cost[mask]
+        two = torch.topk(cost, 2, dim=1, largest=False)
+        own = two.indices[:, 0]
+        gain = two.values[:, 1] - two.values[:, 0]
+        k_max = self.n_clusters
+        sums = torch.zeros(k_max, device=cost.device).index_add_(0, idx[own], gain)
+        cnts = torch.zeros(k_max, device=cost.device).index_add_(0, idx[own], torch.ones_like(gain))
+        return sums, cnts
 
     def training_step(self, batch, batch_idx):
         features_raw, mask, gt, fname, n_subactions = batch
@@ -174,6 +199,9 @@ class VideoSSL(pl.LightningModule):
                     # measure usage on the unbalanced relaxation of the same problem
                     usage_src = self.segment(features, mask, train=True, relax_actions=True)
                 self.dp.update(DPStickBreakingMarginal.segment_usage(usage_src, mask))
+                if self.dp_merge_delta is not None:
+                    self.dp.accumulate_redundancy(*self.redundancy(features, mask))
+                    self.dp.prune_redundant(self.dp_merge_delta)
                 if self.dp_merge_cos is not None:
                     self.dp.merge_similar(self.clusters.data, self.dp_merge_cos)
 
@@ -486,11 +514,20 @@ if __name__ == '__main__':
                         help='Gamma(a0, b0) hyperprior on gamma (e.g. 1 1); omitted = fixed gamma')
     parser.add_argument('--dp-prune-eps', type=float, default=None, help='prune threshold on q share (default 1/(2 K_max))')
     parser.add_argument('--dp-decay', type=float, default=0.99, help='decay of running usage counts per q-step')
-    parser.add_argument('--dp-warmup', type=int, default=20, help='q-steps before pruning is allowed')
+    parser.add_argument('--dp-warmup', type=int, default=None, help='q-steps before pruning is allowed (overrides --dp-warmup-frac)')
+    parser.add_argument('--dp-warmup-frac', type=float, default=0.5,
+                        help='fraction of training steps before pruning is allowed: prototype redundancy is only '
+                             'identifiable once the representation has settled')
     parser.add_argument('--dp-usage', type=str, default='plan', choices=['plan', 'codes'],
                         help='usage for the q-step: OT plan (Gamma*) or the unconstrained network codes')
     parser.add_argument('--dp-usage-lambda', type=float, default=0.01,
                         help='KL weight of the unbalanced relaxation used for the q-step when actions are balanced')
+    parser.add_argument('--dp-merge-delta', type=float, default=0.1,
+                        help='DP-means style pruning: drop a prototype whose frames cost < delta more (mean cosine '
+                             'distance) on their runner-up prototype; negative disables')
+    parser.add_argument('--dp-train-marginal', type=str, default='uniform', choices=['uniform', 'learned'],
+                        help='marginal used for training pseudo-labels: equipartition over active prototypes '
+                             '(collapse-safe) or the learned q; evaluation always uses the learned q')
     parser.add_argument('--dp-merge-cos', type=float, default=None,
                         help='merge active prototypes whose cosine similarity exceeds this (off by default)')
 
@@ -540,8 +577,11 @@ if __name__ == '__main__':
                        train_eps=args.eps_train, eval_eps=args.eps_eval, radius_gw=args.radius_gw, n_ot_train=args.n_ot_train, n_ot_eval=args.n_ot_eval,
                        n_frames=args.n_frames, lr=args.learning_rate, weight_decay=args.weight_decay, rho=args.rho, visualize=args.visualize,
                        marginal=args.marginal, dp_gamma=args.dp_gamma, dp_prune_eps=args.dp_prune_eps, dp_gamma_prior=args.dp_gamma_prior,
-                       dp_decay=args.dp_decay, dp_warmup=args.dp_warmup, dp_usage=args.dp_usage,
-                       dp_usage_lambda=args.dp_usage_lambda, dp_merge_cos=args.dp_merge_cos, n_gt_skills=data_test.n_subactions)
+                       dp_decay=args.dp_decay, dp_usage=args.dp_usage,
+                       dp_warmup=args.dp_warmup if args.dp_warmup is not None else int(args.dp_warmup_frac * args.n_epochs * len(train_loader)),
+                       dp_usage_lambda=args.dp_usage_lambda, dp_merge_cos=args.dp_merge_cos,
+                       dp_merge_delta=args.dp_merge_delta if args.dp_merge_delta >= 0 else None,
+                       dp_train_marginal=args.dp_train_marginal, n_gt_skills=data_test.n_subactions)
 
     # Conditionally create the TensorBoard logger if logging is enabled.
     if args.log:
