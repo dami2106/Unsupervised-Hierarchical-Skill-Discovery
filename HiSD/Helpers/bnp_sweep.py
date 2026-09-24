@@ -17,6 +17,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -121,17 +122,29 @@ def sweep(args):
             extra['dp-gamma-prior'] = args.gamma_prior
         jobs.append(({'config': f'dp_g{gamma}_{usage}', 'K': kmax, 'seed': seed}, extra))
 
+    # resumable: rows are appended to sweep_runs.csv as they finish and finished jobs are skipped
+    runs_csv = out / 'sweep_runs.csv'
+    done = set()
+    if runs_csv.exists():
+        prev = pd.read_csv(runs_csv)
+        done = {(r.config, int(r.K), int(r.seed)) for r in prev.itertuples()}
+    jobs = [j for j in jobs if (j[0]['config'], j[0]['K'], j[0]['seed']) not in done]
+    lock = threading.Lock()
+
     def work(job):
         tag, extra = job
         m = run_train(params, {**base_extra(args), **extra})
         row = {**tag, **m}
         print(row, flush=True)
+        if m:
+            with lock:
+                pd.DataFrame([row]).to_csv(runs_csv, mode='a', header=not runs_csv.exists(), index=False)
         return row
 
     with ThreadPoolExecutor(args.jobs) as ex:
-        rows = list(ex.map(work, jobs))
-    df = pd.DataFrame(rows)
-    df.to_csv(out / 'sweep_runs.csv', index=False)
+        list(ex.map(work, jobs))
+    df = pd.read_csv(runs_csv)
+    df = df[df.seed.isin(args.seeds)]
     cols = [c for c in ['test_miou_full', 'test_mof_full', 'test_f1_full', 'test_miou_per', 'test_nmi',
                         'test_k_hat', 'test_k_used', 'test_k_err'] if c in df]
     summary = df.groupby(['config', 'K'])[cols].agg(['mean', 'std']).round(3)

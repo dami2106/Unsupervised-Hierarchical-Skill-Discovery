@@ -29,6 +29,8 @@ from structure_metrics import compute_structure_metrics  # noqa: E402
 def read_sequences(input_dir, skill_folder):
     folder = Path(input_dir) / skill_folder
     names = sorted(os.listdir(folder))
+    if any(n.endswith('_skills.txt') for n in names):  # predicted_skills also holds *_segments.txt
+        names = [n for n in names if n.endswith('_skills.txt')]
     seqs = []
     for name in names:
         items = (folder / name).read_text().strip().split()

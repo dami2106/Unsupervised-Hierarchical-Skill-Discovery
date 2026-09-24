@@ -2,6 +2,14 @@ import os
 from collections import Counter
 
 
+def _sequence_files(trace_directory, skill_folder):
+    """Per-episode label files; predicted_skills also holds *_segments.txt, which are not sequences."""
+    names = os.listdir(f"{trace_directory}/{skill_folder}/")
+    if any(n.endswith('_skills.txt') for n in names):
+        names = [n for n in names if n.endswith('_skills.txt')]
+    return names
+
+
 def get_unique_sequence_list(trace_directory, skill_folder = "predicted_skills", mapping = None):
     """
     Get a list of unique sequences from the trace directory.
@@ -12,7 +20,7 @@ def get_unique_sequence_list(trace_directory, skill_folder = "predicted_skills",
         # Reverse the mapping dictionary
         mapping = {v: k for k, v in mapping.items()}
 
-    for filename in os.listdir(f"{trace_directory}/{skill_folder}/"):
+    for filename in _sequence_files(trace_directory, skill_folder):
         with open(os.path.join(f"{trace_directory}/{skill_folder}/", filename), 'r') as file:
             sequence = file.read().strip().split()
 
@@ -46,7 +54,7 @@ def get_all_sequences_list(trace_directory, skill_folder = "predicted_skills", m
         # Reverse the mapping dictionary
         mapping = {v: k for k, v in mapping.items()}
 
-    for filename in os.listdir(f"{trace_directory}/{skill_folder}/"):
+    for filename in _sequence_files(trace_directory, skill_folder):
         with open(os.path.join(f"{trace_directory}/{skill_folder}/", filename), 'r') as file:
             sequence = file.read().strip().split()
 
