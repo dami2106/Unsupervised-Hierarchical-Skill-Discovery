@@ -18,7 +18,12 @@ Example:
 import argparse
 import json
 import logging
+
 import os
+import sys
+
+# Always use the repository's modified Craftax (Craftax/craftax), never a pip-installed one
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +31,10 @@ import numpy as np
 from tqdm import tqdm
 
 from craftax.craftax_env import make_craftax_env_from_name
+import craftax
+assert os.path.dirname(os.path.abspath(craftax.__file__)) == os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "craftax"), f"using a non-local craftax: {craftax.__file__}"
+
 import block_types as bt
 import action_types as at
 from astar import plan_to_object, plan_to_object_with_mining, set_astar_log_level
