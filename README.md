@@ -143,6 +143,14 @@ bash RL_Scripts/ppo_hierarchy_asot.sh
 
 Equivalent scripts for Minecraft are located in `Minecraft/RL/` and `Minecraft/Learn_Skill_Data/`.
 
+## Bayesian-nonparametric extension
+
+This branch adds three ablation-ready components: K-free segmentation via a learned DP
+marginal in ASOT (A), a Pitman–Yor noisy-channel grammar over skill strings (B), and
+duration-aware option termination with soft initiation masks (C). See
+[`HiSD/BNP_EXTENSION.md`](HiSD/BNP_EXTENSION.md) for the method, usage, and Craftax
+verification results.
+
 ## Citation
 
 ```bibtex

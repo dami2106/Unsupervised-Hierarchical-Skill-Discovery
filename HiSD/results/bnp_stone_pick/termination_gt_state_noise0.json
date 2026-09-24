@@ -1,0 +1,125 @@
+{
+  "rules": {
+    "bayes_en/sample": {
+      "exact": 0.8779,
+      "within1": 0.9226,
+      "mae": 0.3688
+    },
+    "bayes_en/thr": {
+      "exact": 0.9143,
+      "within1": 0.946,
+      "mae": 0.2984
+    },
+    "bayes_nnpu/sample": {
+      "exact": 0.4347,
+      "within1": 0.6604,
+      "mae": 1.5055
+    },
+    "bayes_nnpu/thr": {
+      "exact": 0.6286,
+      "within1": 0.7429,
+      "mae": 1.0635
+    },
+    "duration/sample": {
+      "exact": 0.2442,
+      "within1": 0.5318,
+      "mae": 1.9034
+    },
+    "duration/thr": {
+      "exact": 0.3175,
+      "within1": 0.3905,
+      "mae": 2.4349
+    },
+    "horizon": {
+      "exact": 0.1429,
+      "within1": 0.1429,
+      "mae": 14.2063
+    },
+    "noisy_or_en/sample": {
+      "exact": 0.5703,
+      "within1": 0.7463,
+      "mae": 1.1397
+    },
+    "noisy_or_en/thr": {
+      "exact": 0.9016,
+      "within1": 0.9302,
+      "mae": 0.3524
+    },
+    "noisy_or_nnpu/sample": {
+      "exact": 0.249,
+      "within1": 0.5018,
+      "mae": 2.2739
+    },
+    "noisy_or_nnpu/thr": {
+      "exact": 0.3492,
+      "within1": 0.581,
+      "mae": 1.8381
+    },
+    "pu_horizon": {
+      "exact": 0.9587,
+      "within1": 0.9683,
+      "mae": 0.1651
+    },
+    "state_en/sample": {
+      "exact": 0.8872,
+      "within1": 0.9246,
+      "mae": 0.357
+    },
+    "state_en/thr": {
+      "exact": 0.9365,
+      "within1": 0.9524,
+      "mae": 0.2571
+    },
+    "state_nnpu/sample": {
+      "exact": 0.3175,
+      "within1": 0.5447,
+      "mae": 2.0716
+    },
+    "state_nnpu/thr": {
+      "exact": 0.4317,
+      "within1": 0.6444,
+      "mae": 1.5524
+    }
+  },
+  "end_state_micro_f1": {
+    "nnpu": 0.626,
+    "en": 0.9451,
+    "en_thr": 0.9422
+  },
+  "durations": {
+    "wood": {
+      "mean": 5.45,
+      "cap": 9
+    },
+    "table": {
+      "mean": 2.01,
+      "cap": 4
+    },
+    "wooden_pickaxe": {
+      "mean": 3.62,
+      "cap": 7
+    },
+    "stone": {
+      "mean": 4.88,
+      "cap": 8
+    },
+    "stone_pickaxe": {
+      "mean": 5.77,
+      "cap": 10
+    }
+  },
+  "n_test_segments": 315,
+  "config": {
+    "dataset": "../Craftax/Traces/stone_pick",
+    "skills_dir": "None",
+    "gt_dir": "None",
+    "features_name": "pca_features",
+    "horizon": "64",
+    "cap_quantile": "0.95",
+    "test_frac": "0.3",
+    "state_noise": "0.0",
+    "no_elkan_noto": "False",
+    "seed": "0",
+    "out": "runs/bnp_eval/stone_pick/termination_gt_noise0.json"
+  }
+}

@@ -27,7 +27,8 @@ def plot_segmentation_gt(gt, pred, mask, gt_uniq=None, pred_to_gt=None, exclude_
         pred_opt, gt_opt = zip(*pred_to_gt.items())
 
     pred_to_gt_dict = {pr_lab: gt_lab for pr_lab, gt_lab in zip(pred_opt, gt_opt)}
-    pred_ = np.vectorize(pred_to_gt_dict.get)(pred_)
+    # clusters left unmatched by the Hungarian assignment (more predicted than GT classes) map to -1
+    pred_ = np.vectorize(lambda x: pred_to_gt_dict.get(x, -1))(pred_)
 
     n_frames = len(pred_)
     if gt_uniq is None:

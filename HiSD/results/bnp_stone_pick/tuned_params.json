@@ -1,0 +1,19 @@
+{
+  "alpha-train": 0.5,
+  "alpha-eval": 0.6900000000000001,
+  "lambda-frames-train": 0.09,
+  "lambda-actions-train": 0.09,
+  "lambda-frames-eval": 0.02,
+  "lambda-actions-eval": 0.08,
+  "eps-train": 0.196,
+  "eps-eval": 0.133,
+  "radius-gw": 0.046,
+  "learning-rate": 1e-05,
+  "weight-decay": 0.001,
+  "n-epochs": 15,
+  "ub-frames": false,
+  "ub-actions": false,
+  "std-feats": true,
+  "rho": 0.28700000000000003,
+  "n-frames": 28
+}

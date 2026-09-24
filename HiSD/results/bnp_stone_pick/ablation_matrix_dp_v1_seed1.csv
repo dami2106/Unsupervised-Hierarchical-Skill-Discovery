@@ -1,0 +1,10 @@
+config,segmenter,grammar,options,unique_trees,unique_types,tree_size,max_branching,heldout_ppl,mdl_bits,term_exact,term_within1,term_mae,term_rule
+Old HiSD,fixed,seq,pu,9,7,10.11,2.01,1.122,218.7,0.318,0.571,1.952,pu_horizon
+A,dp,seq,pu,9,7,10.11,2.01,1.069,183.4,0.216,0.46,2.448,pu_horizon
+A+B,dp,np,pu,5,5,10.1,2.01,1.074,161.0,0.216,0.46,2.448,pu_horizon
+A+C,dp,seq,dur,9,7,10.11,2.01,1.069,183.4,0.327,0.552,1.911,bayes_en/thr
+A+B+C,dp,np,dur,5,5,10.1,2.01,1.074,161.0,0.327,0.552,1.911,bayes_en/thr
+B+C,fixed,np,dur,5,4,10.03,2.05,1.139,175.2,0.327,0.581,1.81,bayes_en/thr
+B-only,fixed,np,pu,5,4,10.03,2.05,1.139,175.2,0.318,0.571,1.952,pu_horizon
+C-only,fixed,seq,dur,9,7,10.11,2.01,1.122,218.7,0.327,0.581,1.81,bayes_en/thr
+Ground truth,,,,1,1,9.0,7.0,,,,,,
