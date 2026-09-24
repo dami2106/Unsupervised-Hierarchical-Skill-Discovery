@@ -69,8 +69,18 @@ def entropy(T, eps=1e-10):
     return (-T * torch.log(T + eps) + T).sum(dim=(1, 2))
 
 
+def _action_marginal(q, B, K, dev):
+    # target action marginal: uniform (original ASOT) or a learned q of shape (K,) / (B, K)
+    if q is None:
+        return torch.ones((B, K), device=dev) / K
+    q = q.to(dev).float()
+    if q.dim() == 1:
+        q = q.unsqueeze(0).expand(B, K)
+    return q / q.sum(dim=1, keepdim=True)
+
+
 def asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
-                   lambda_frames, lambda_actions, mask=None):
+                   lambda_frames, lambda_actions, mask=None, q=None):
     dev = cost_matrix.device
     B, N, K = cost_matrix.shape
         
@@ -84,7 +94,7 @@ def asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
     fgw_obj = (grad_fgw(T_mask, cost_matrix, alpha, Cv) * T_mask).sum(dim=(1, 2))
     
     # Unbalanced stuff
-    dy = torch.ones((B, K), device=dev) / K
+    dy = _action_marginal(q, B, K, dev)
     dx = torch.ones((B, N), device=dev) / nnz[:, None]
     
     frames_marg = T_mask.sum(dim=2)
@@ -111,14 +121,15 @@ def asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
 
 def segment_asot(cost_matrix, mask=None, eps=0.07, alpha=0.3, radius=0.04, ub_frames=False,
                  ub_actions=True, lambda_frames=0.1, lambda_actions=0.05, n_iters=(25, 1),
-                 stable_thres=7., step_size=None):
+                 stable_thres=7., step_size=None, q=None):
+    """q: optional target action marginal (K,) or (B, K); None = uniform (original ASOT)."""
     dev = cost_matrix.device
     B, N, K = cost_matrix.shape
     if mask is None:
         mask = torch.full((B, N), 1, dtype=bool, device=dev)
     nnz = mask.sum(dim=1)
 
-    dy = torch.ones((B, K, 1), device=dev) / K
+    dy = _action_marginal(q, B, K, dev).unsqueeze(2)
     dx = torch.ones((B, N, 1), device=dev) / nnz[:, None, None]
 
     T = dx * dy.transpose(1, 2)
@@ -132,7 +143,7 @@ def segment_asot(cost_matrix, mask=None, eps=0.07, alpha=0.3, radius=0.04, ub_fr
     while True:
         with torch.no_grad():
             obj = asot_objective(T, cost_matrix, eps, alpha, radius, ub_frames, ub_actions,
-                                lambda_frames, lambda_actions, mask=mask)
+                                lambda_frames, lambda_actions, mask=mask, q=q)
         obj_trace.append(obj)
         
         if it >= n_iters[0]:

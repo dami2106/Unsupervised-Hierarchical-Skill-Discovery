@@ -17,6 +17,9 @@ from dataset_loader import RLDataset
 import asot
 from utils import *
 from metrics import ClusteringMetrics, indep_eval_metrics
+from bnp_marginal import DPStickBreakingMarginal
+from sklearn.metrics.cluster import normalized_mutual_info_score
+import json
 
 import os
 
@@ -32,7 +35,9 @@ class VideoSSL(pl.LightningModule):
     def __init__(self, lr=1e-4, weight_decay=1e-4, layer_sizes=[64, 128, 40], n_clusters=20, alpha_train=0.3, alpha_eval=0.3,
                  n_ot_train=[50, 1], n_ot_eval=[50, 1], step_size=None, train_eps=0.06, eval_eps=0.01, ub_frames=False, ub_actions=True,
                  lambda_frames_train=0.05, lambda_actions_train=0.05, lambda_frames_eval=0.05, lambda_actions_eval=0.01,
-                 temp=0.1, radius_gw=0.04, learn_clusters=True, n_frames=256, rho=0.1, visualize=False):
+                 temp=0.1, radius_gw=0.04, learn_clusters=True, n_frames=256, rho=0.1, visualize=False,
+                 marginal='uniform', dp_gamma=1.0, dp_prune_eps=None, dp_gamma_prior=None, dp_decay=0.99,
+                 dp_warmup=20, dp_usage='plan', dp_usage_lambda=0.01, dp_merge_cos=None, n_gt_skills=None):
         super().__init__()
         self.lr = lr
         self.weight_decay = weight_decay
@@ -72,6 +77,20 @@ class VideoSSL(pl.LightningModule):
         d = self.layer_sizes[-1]
         self.clusters = nn.parameter.Parameter(data=F.normalize(torch.randn(self.n_clusters, d), dim=-1), requires_grad=learn_clusters)
 
+        # Component A: learned DP stick-breaking target marginal (n_clusters acts as K_max)
+        self.marginal = marginal
+        self.dp_usage = dp_usage
+        self.dp_usage_lambda = dp_usage_lambda
+        self.dp_merge_cos = dp_merge_cos
+        self.n_gt_skills = n_gt_skills
+        if marginal == 'dp':
+            self.dp = DPStickBreakingMarginal(n_clusters, gamma=dp_gamma, prune_eps=dp_prune_eps,
+                                              gamma_prior=dp_gamma_prior, decay=dp_decay,
+                                              warmup_updates=dp_warmup)
+        else:
+            self.dp = None
+        self.test_pred_labels, self.test_gt_labels = [], []
+
         # initialize evaluation metrics
         self.mof = ClusteringMetrics(metric='mof')
         self.f1 = ClusteringMetrics(metric='f1')
@@ -93,6 +112,45 @@ class VideoSSL(pl.LightningModule):
         fig_path = os.path.join(figures_dir, f"{figure_name}_step_{global_step}.png")
         fig.savefig(fig_path)
 
+    def active_clusters(self):
+        if self.dp is None:
+            return torch.arange(self.n_clusters, device=self.clusters.device)
+        return torch.nonzero(self.dp.active).squeeze(1)
+
+    def compute_codes(self, features):
+        codes = torch.exp(features @ self.clusters.T[None, ...] / self.temp)
+        if self.dp is not None:
+            codes = codes * self.dp.active.float()  # pruned prototypes receive no mass
+        return codes / codes.sum(dim=-1, keepdim=True)
+
+    def segment(self, features, mask, train, relax_actions=False):
+        """Run ASOT over the active prototypes (all K for uniform q) and return a (B, T, K_max) plan.
+
+        relax_actions: solve the unbalanced-actions relaxation (KL weight dp_usage_lambda) instead;
+        used only to measure data-driven usage for the q-step when the action marginal is hard.
+        """
+        B, T, _ = features.shape
+        idx = self.active_clusters()
+        k_act = len(idx)
+        cost_matrix = 1. - features @ self.clusters[idx].T.unsqueeze(0)
+        cost_matrix = cost_matrix + asot.temporal_prior(T, k_act, self.rho, features.device)
+        q = None if self.dp is None else self.dp.q[idx]
+        if train:
+            kw = dict(eps=self.train_eps, alpha=self.alpha_train, lambda_frames=self.lambda_frames_train,
+                      lambda_actions=self.lambda_actions_train, n_iters=self.n_ot_train)
+        else:
+            kw = dict(eps=self.eval_eps, alpha=self.alpha_eval, lambda_frames=self.lambda_frames_eval,
+                      lambda_actions=self.lambda_actions_eval, n_iters=self.n_ot_eval)
+        ub_actions = self.ub_actions
+        if relax_actions:
+            ub_actions = True
+            kw['lambda_actions'] = self.dp_usage_lambda
+        plan_act, _ = asot.segment_asot(cost_matrix, mask, radius=self.radius_gw, ub_frames=self.ub_frames,
+                                        ub_actions=ub_actions, step_size=self.step_size, q=q, **kw)
+        plan = torch.zeros(B, T, self.n_clusters, device=features.device, dtype=plan_act.dtype)
+        plan[:, :, idx] = plan_act
+        return plan
+
     def training_step(self, batch, batch_idx):
         features_raw, mask, gt, fname, n_subactions = batch
         with torch.no_grad():
@@ -102,21 +160,28 @@ class VideoSSL(pl.LightningModule):
         features = F.normalize(self.mlp(features_raw.reshape(-1, features_raw.shape[-1])).reshape(B, T, D), dim=-1)
 
 
-        codes = torch.exp(features @ self.clusters.T[None, ...] / self.temp)
-        codes = codes / codes.sum(dim=-1, keepdim=True)
-
-
+        codes = self.compute_codes(features)
 
         with torch.no_grad():  # pseudo-labels from OT
-            temp_prior = asot.temporal_prior(T, self.n_clusters, self.rho, features.device)
-            cost_matrix = 1. - features @ self.clusters.T.unsqueeze(0)
-            cost_matrix += temp_prior
-            opt_codes, _ = asot.segment_asot(cost_matrix, mask, eps=self.train_eps, alpha=self.alpha_train, radius=self.radius_gw,
-                                             ub_frames=self.ub_frames, ub_actions=self.ub_actions, lambda_frames=self.lambda_frames_train,
-                                             lambda_actions=self.lambda_actions_train, n_iters=self.n_ot_train, step_size=self.step_size)
+            opt_codes = self.segment(features, mask, train=True)
+            if self.dp is not None:  # q-step: closed-form stick-breaking posterior update
+                if self.dp_usage == 'codes':
+                    usage_src = codes
+                elif self.ub_actions:
+                    usage_src = opt_codes
+                else:
+                    # with a hard action marginal the realised usage equals q (a fixed point), so
+                    # measure usage on the unbalanced relaxation of the same problem
+                    usage_src = self.segment(features, mask, train=True, relax_actions=True)
+                self.dp.update(DPStickBreakingMarginal.segment_usage(usage_src, mask))
+                if self.dp_merge_cos is not None:
+                    self.dp.merge_similar(self.clusters.data, self.dp_merge_cos)
 
         loss_ce = -((opt_codes * torch.log(codes + num_eps)) * mask[..., None]).sum(dim=2).mean()
         self.log('train_loss', loss_ce)
+        if self.dp is not None:
+            self.log('train_k_hat', float(self.dp.k_hat))
+            self.log('train_dp_gamma', float(self.dp.gamma))
         return loss_ce
 
     def validation_step(self, batch, batch_idx):
@@ -126,12 +191,7 @@ class VideoSSL(pl.LightningModule):
         features = F.normalize(self.mlp(features_raw.reshape(-1, features_raw.shape[-1])).reshape(B, T, D), dim=-1)
 
         # log clustering metrics over full epoch
-        temp_prior = asot.temporal_prior(T, self.n_clusters, self.rho, features.device)
-        cost_matrix = 1. - features @ self.clusters.T.unsqueeze(0)
-        cost_matrix += temp_prior
-        segmentation, _ = asot.segment_asot(cost_matrix, mask, eps=self.eval_eps, alpha=self.alpha_eval, radius=self.radius_gw,
-                                            ub_frames=self.ub_frames, ub_actions=self.ub_actions, lambda_frames=self.lambda_frames_eval,
-                                            lambda_actions=self.lambda_actions_eval, n_iters=self.n_ot_eval, step_size=self.step_size)
+        segmentation = self.segment(features, mask, train=False)
         segments = segmentation.argmax(dim=2)
         self.mof.update(segments, gt, mask)
         self.f1.update(segments, gt, mask)
@@ -144,16 +204,13 @@ class VideoSSL(pl.LightningModule):
         self.log('val_miou_per', metrics['miou'])
 
         # log validation loss
-        codes = torch.exp(features @ self.clusters.T / self.temp)
-        codes /= codes.sum(dim=-1, keepdim=True)
-        pseudo_labels, _ = asot.segment_asot(cost_matrix, mask, eps=self.train_eps, alpha=self.alpha_train, radius=self.radius_gw,
-                                             ub_frames=self.ub_frames, ub_actions=self.ub_actions, lambda_frames=self.lambda_frames_train,
-                                             lambda_actions=self.lambda_actions_train, n_iters=self.n_ot_train, step_size=self.step_size)
+        codes = self.compute_codes(features)
+        pseudo_labels = self.segment(features, mask, train=True)
         loss_ce = -((pseudo_labels * torch.log(codes + num_eps)) * mask[..., None]).sum(dim=[1, 2]).mean()
         self.log('val_loss', loss_ce)
 
         # plot qualitative examples of pseudo-labelling and embeddings for 5 videos evenly spaced in dataset
-        spacing =  int(self.trainer.num_val_batches[0] / 5)
+        spacing = max(1, int(self.trainer.num_val_batches[0] / 5))
         if batch_idx % spacing == 0 and self.visualize:
             plot_idx = int(batch_idx / spacing)
             global_step = self.trainer.global_step
@@ -197,13 +254,10 @@ class VideoSSL(pl.LightningModule):
         features = F.normalize(self.mlp(features_raw.reshape(-1, features_raw.shape[-1])).reshape(B, T, D), dim=-1)
 
         # log clustering metrics over full epoch
-        temp_prior = asot.temporal_prior(T, self.n_clusters, self.rho, features.device)
-        cost_matrix = 1. - features @ self.clusters.T.unsqueeze(0)
-        cost_matrix += temp_prior
-        segmentation, _ = asot.segment_asot(cost_matrix, mask, eps=self.eval_eps, alpha=self.alpha_eval, radius=self.radius_gw,
-                                            ub_frames=self.ub_frames, ub_actions=self.ub_actions, lambda_frames=self.lambda_frames_eval,
-                                            lambda_actions=self.lambda_actions_eval, n_iters=self.n_ot_eval, step_size=self.step_size)
+        segmentation = self.segment(features, mask, train=False)
         segments = segmentation.argmax(dim=2)
+        self.test_pred_labels.extend(segments[mask].tolist())
+        self.test_gt_labels.extend(gt[mask].tolist())
         self.mof.update(segments, gt, mask)
         self.f1.update(segments, gt, mask)
         self.miou.update(segments, gt, mask)
@@ -239,6 +293,23 @@ class VideoSSL(pl.LightningModule):
         self.log('test_mof_full',  mof)
         self.log('test_f1_full',   f1)
         self.log('test_miou_full', miou)
+
+        # K-free diagnostics: inferred K_hat (active prototypes), number of skills actually
+        # predicted, K_hat error vs ground truth and NMI (label-permutation invariant)
+        k_used = len(np.unique(self.test_pred_labels))
+        k_gt = len(np.unique(self.test_gt_labels))
+        k_hat = self.dp.k_hat if self.dp is not None else self.n_clusters
+        self.log('test_k_hat', float(k_hat))
+        self.log('test_k_used', float(k_used))
+        self.log('test_k_err', float(abs(k_used - k_gt)))
+        self.log('test_nmi', float(normalized_mutual_info_score(self.test_gt_labels, self.test_pred_labels)))
+        if self.dp is not None:
+            base_dir = getattr(self.logger, 'log_dir', None)
+            if base_dir is not None:
+                os.makedirs(base_dir, exist_ok=True)
+                with open(os.path.join(base_dir, 'dp_marginal.json'), 'w') as f:
+                    json.dump(self.dp.state_summary(), f, indent=2)
+        self.test_pred_labels, self.test_gt_labels = [], []
 
         if self.visualize:
             for i, (mof, pred, gt, mask, fname) in enumerate(self.test_cache):
@@ -405,7 +476,23 @@ if __name__ == '__main__':
     parser.add_argument('--k-means', '-km', action='store_false', help='do not initialize clusters with kmeans default = True')
     parser.add_argument('--layers', '-ls', default=[500, 256, 50], nargs='+', type=int, help='layer sizes for MLP (in, hidden, ..., out)')
     parser.add_argument('--rho', type=float, default=0.1, help='Factor for global structure weighting term')
-    parser.add_argument('--n-clusters', '-c', type=int, default=5, help='number of actions/clusters')
+    parser.add_argument('--n-clusters', '-c', type=int, default=5, help='number of actions/clusters (K_max when --marginal dp)')
+
+    # Component A: K-free segmentation via a learned DP stick-breaking target marginal
+    parser.add_argument('--marginal', type=str, default='uniform', choices=['uniform', 'dp'],
+                        help='target action marginal q: uniform over K (original ASOT) or learned DP stick-breaking')
+    parser.add_argument('--dp-gamma', type=float, default=1.0, help='DP concentration gamma')
+    parser.add_argument('--dp-gamma-prior', type=float, nargs=2, default=None, metavar=('A0', 'B0'),
+                        help='Gamma(a0, b0) hyperprior on gamma (e.g. 1 1); omitted = fixed gamma')
+    parser.add_argument('--dp-prune-eps', type=float, default=None, help='prune threshold on q share (default 1/(2 K_max))')
+    parser.add_argument('--dp-decay', type=float, default=0.99, help='decay of running usage counts per q-step')
+    parser.add_argument('--dp-warmup', type=int, default=20, help='q-steps before pruning is allowed')
+    parser.add_argument('--dp-usage', type=str, default='plan', choices=['plan', 'codes'],
+                        help='usage for the q-step: OT plan (Gamma*) or the unconstrained network codes')
+    parser.add_argument('--dp-usage-lambda', type=float, default=0.01,
+                        help='KL weight of the unbalanced relaxation used for the q-step when actions are balanced')
+    parser.add_argument('--dp-merge-cos', type=float, default=None,
+                        help='merge active prototypes whose cosine similarity exceeds this (off by default)')
 
     # system/logging params
     parser.add_argument('--val-freq', '-vf', type=int, default=5, help='validation epoch frequency (epochs)')
@@ -451,7 +538,10 @@ if __name__ == '__main__':
                        ub_frames=args.ub_frames, ub_actions=args.ub_actions, lambda_frames_train=args.lambda_frames_train, lambda_frames_eval=args.lambda_frames_eval,
                        lambda_actions_train=args.lambda_actions_train, lambda_actions_eval=args.lambda_actions_eval, step_size=args.step_size,
                        train_eps=args.eps_train, eval_eps=args.eps_eval, radius_gw=args.radius_gw, n_ot_train=args.n_ot_train, n_ot_eval=args.n_ot_eval,
-                       n_frames=args.n_frames, lr=args.learning_rate, weight_decay=args.weight_decay, rho=args.rho, visualize=args.visualize)
+                       n_frames=args.n_frames, lr=args.learning_rate, weight_decay=args.weight_decay, rho=args.rho, visualize=args.visualize,
+                       marginal=args.marginal, dp_gamma=args.dp_gamma, dp_prune_eps=args.dp_prune_eps, dp_gamma_prior=args.dp_gamma_prior,
+                       dp_decay=args.dp_decay, dp_warmup=args.dp_warmup, dp_usage=args.dp_usage,
+                       dp_usage_lambda=args.dp_usage_lambda, dp_merge_cos=args.dp_merge_cos, n_gt_skills=data_test.n_subactions)
 
     # Conditionally create the TensorBoard logger if logging is enabled.
     if args.log:

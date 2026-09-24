@@ -40,8 +40,24 @@ parser.add_argument("--run_name", type=str, default='test_ppo_hierarchy')
 
 parser.add_argument("--ppo_seed", type=int, default=888)
 
+# Component C: duration-aware termination + soft initiation masks
+parser.add_argument("--termination_mode", type=str, default="pu_horizon",
+                    choices=["pu_horizon", "duration", "noisy_or", "bayes"])
+parser.add_argument("--durations_path", type=str, default=None, help="relative to --root")
+parser.add_argument("--soft_masks", action="store_true")
+# Component B: hierarchies drawn from the grammar posterior (run-level sampling:
+# each PPO seed uses one posterior draw from <hierarchy_dir>/posterior_samples)
+parser.add_argument("--hierarchy_posterior_sample", action="store_true")
+
 
 args, _ = parser.parse_known_args()
+
+if args.hierarchy_posterior_sample:
+    import os
+    post = os.path.join(args.hierarchy_dir, "posterior_samples")
+    draws = sorted(d for d in os.listdir(post) if d.startswith("sample_"))
+    args.hierarchy_dir = os.path.join(post, draws[args.ppo_seed % len(draws)])
+    print("Using grammar posterior draw:", args.hierarchy_dir)
 
 if args.symbol_map == "truth":
     symbol_map = {
@@ -83,6 +99,9 @@ def make_options_env(*, seed: int, render_mode=None, max_episode_steps=100):
             pca_model_path=args.pca_model_path,
             pu_start_models_dir=args.pu_start_models_dir,
             pu_end_models_dir=args.pu_end_models_dir,
+            termination_mode=args.termination_mode,
+            durations_path=args.durations_path,
+            soft_masks=args.soft_masks,
         )
 
         # 1) ActionMasker wraps the env that has `action_masks`
@@ -138,8 +157,15 @@ if __name__ == "__main__":
 
     print("Training PPO on options to get wood_pickaxe SEED : ", args.ppo_seed)
 
+    policy = "CnnPolicy"
+    if args.soft_masks:
+        import os, sys
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "HiSD", "options"))
+        from soft_mask_ppo import SoftMaskCnnPolicy
+        policy = SoftMaskCnnPolicy
+
     model = MaskablePPO(
-        "CnnPolicy",                   # pixels -> CNN
+        policy,                        # pixels -> CNN
         train_env,
         verbose=1,
         tensorboard_log="./tb_logs_ppo_craftax",

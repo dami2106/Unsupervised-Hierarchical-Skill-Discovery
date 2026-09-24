@@ -8,6 +8,11 @@ from joblib import load as joblib_load
 import glob
 from typing import Any, Dict, List, Optional, Tuple
 import gymnasium as gym
+import sys
+# Component C helpers (duration models / termination combiners) live in HiSD/options
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'HiSD', 'options'))
+from duration import PoissonGammaDuration, composite_duration  # noqa: E402
+from termination import combine_bayes, soft_initiation_mask  # noqa: E402
 # Optional: only import torchvision if we actually need a ResNet
 _RESNET_IMPORTED = False
 
@@ -414,12 +419,14 @@ def _clear_rt(models: Dict[str, Any], skill: str, call_id: Optional[int]) -> Non
     cr.pop(key, None)
 
 
-def should_terminate(models, state, skill, call_id: Optional[int] = None):
+def should_terminate(models, state, skill, call_id: Optional[int] = None, t: Optional[int] = None):
     """
     Phase-aware termination.
     - Primitive skill: use its end-model directly.
     - Composite skill: only allow termination when we're on the *final* leaf, and its end fires,
       or when we've already advanced past the last leaf (idx >= len(seq)).
+    t: steps the option has run (used by duration-aware termination, component C). With
+       duration models attached, a composite also stops at its convolved duration cap.
     """
     # Composite skill special-case
     seq = _get_seq_for_skill(models, skill)
@@ -430,28 +437,90 @@ def should_terminate(models, state, skill, call_id: Optional[int] = None):
         # Finished all leaves already?
         if idx >= len(seq):
             return True
+        caps = models.get("duration_caps", {})
+        if t is not None and skill in caps and t >= caps[skill]:
+            return True
         # Only last leaf can end the composite
         last_leaf = seq[-1]
         # If we're not yet on the last leaf, composite must not end
         if idx < len(seq) - 1:
             return False
-        # We *are* on the last leaf: gate by its end detector
-        return _primitive_should_terminate(models, state, last_leaf)
+        # We *are* on the last leaf: gate by its end detector (and its own elapsed time)
+        return _primitive_should_terminate(models, state, last_leaf, t=rt.get("leaf_steps"))
 
     # Primitive skill
-    return _primitive_should_terminate(models, state, skill)
+    return _primitive_should_terminate(models, state, skill, t=t)
 
 
-def _primitive_should_terminate(models, state, skill) -> bool:
+def _state_features(models, state):
     state = np.asarray(state).astype(np.float32) / 255.0
     X = state.reshape(1, -1)
     X_centered = models["pca_model"]['scaler'].transform(X)
-    X_feats = models["pca_model"]['pca'].transform(X_centered)
+    return models["pca_model"]['pca'].transform(X_centered)
+
+
+def _primitive_should_terminate(models, state, skill, t: Optional[int] = None) -> bool:
+    X_feats = _state_features(models, state)
     tm = models["termination_models"].get(skill)
-    if tm is None:
-        # No end model: never terminate based on classifier
-        return False
-    return predict_pu_end_state(tm, X_feats)["is_end"]
+    mode = models.get("termination_mode", "pu_horizon")
+    dur = models.get("duration_models", {}).get(skill)
+    if mode == "pu_horizon" or dur is None or t is None:
+        if tm is None:
+            # No end model: never terminate based on classifier
+            return False
+        return predict_pu_end_state(tm, X_feats)["is_end"]
+
+    # Component C: duration hazard combined with the calibrated end-state probability
+    if t >= models["duration_caps"].get(skill, np.inf):
+        return True
+    b_dur = dur.hazard(max(int(t), 1))
+    p_state = predict_pu_end_state(tm, X_feats)["prob"] if tm is not None else 0.
+    p_state = float(np.clip(p_state, 0., 1.))
+    if mode == "duration":
+        beta = b_dur
+    elif mode == "noisy_or":
+        beta = 1. - (1. - b_dur) * (1. - p_state)
+    elif mode == "bayes":
+        meta = tm["meta"] if tm is not None else {}
+        n_pos, n_unl = meta.get("n_train_pos"), meta.get("n_train_unl")
+        prior = n_pos / (n_pos + n_unl) if n_pos and n_unl else 0.5  # classifier's training prior
+        beta = float(combine_bayes(b_dur, p_state, prior)) if tm is not None else b_dur
+    else:
+        raise ValueError(f"unknown termination_mode {mode}")
+    rng = models.setdefault("termination_rng", np.random.default_rng(0))
+    return bool(beta >= 0.5) if models.get("termination_decision", "threshold") == "threshold" \
+        else bool(rng.random() < beta)
+
+
+def attach_duration_models(models, durations_path: str, mode: str = "bayes", cap_quantile: float = 0.95,
+                           decision: str = "threshold", symbol_map: Optional[Dict[str, str]] = None):
+    """Attach per-skill duration models (HiSD/options/fit_durations.py output) for component C.
+
+    Composite skills (Production_*) get the convolution of their leaves' durations."""
+    with open(durations_path) as f:
+        raw = json.load(f)
+    inv = {str(k): v for k, v in (symbol_map or {}).items()}
+    durs = {}
+    for key, d in raw.items():
+        name = inv.get(key, key)  # predicted labels -> skill names used by the option bank
+        durs[name] = PoissonGammaDuration.from_pmf(np.asarray(d["pmf"]))
+    for skill in list(models["skills"]):
+        seq = _get_seq_for_skill(models, skill)
+        if seq is not None and all(c in durs for c in seq):
+            durs[skill] = composite_duration(seq, durs)
+    models["duration_models"] = durs
+    models["duration_caps"] = {k: m.percentile(cap_quantile) for k, m in durs.items()}
+    models["termination_mode"] = mode
+    models["termination_decision"] = decision
+    return models
+
+
+def skill_start_probabilities(models, state) -> np.ndarray:
+    """Calibrated initiation probabilities (aligned to models["skills"]) for soft masks."""
+    Xf = _state_features(models, state)
+    rows = applicable_pu_start_models(models["start_models"], Xf, return_details=True, eps=0.0)
+    prob = {r["skill"]: float(np.clip(r["prob"], 0., 1.)) for r in rows}
+    return np.array([prob.get(s, 0.) for s in models["skills"]], dtype=np.float32)
 
 
 # option_helpers.py
@@ -467,7 +536,7 @@ def bc_policy_hierarchy(models, state, skill, call_id: Optional[int] = None, max
         # If detector says current leaf is done, advance and reset per-leaf counter
         if idx < len(seq):
             cur = seq[idx]
-            if _primitive_should_terminate(models, state, cur):
+            if _primitive_should_terminate(models, state, cur, t=leaf_steps if leaf_steps > 0 else None):
                 idx += 1
                 rt["idx"] = idx
                 rt["leaf_steps"] = 0

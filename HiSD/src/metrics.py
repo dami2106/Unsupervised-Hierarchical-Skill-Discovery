@@ -6,16 +6,19 @@ from scipy.optimize import linear_sum_assignment
 from sklearn.metrics.cluster import normalized_mutual_info_score as nmi_score
 from sklearn.metrics.cluster import adjusted_rand_score
 
-from torchmetrics import Metric
 
 
-class ClusteringMetrics(Metric):
+class ClusteringMetrics:
+    # Plain accumulator (single-process); torchmetrics list states of python ints break
+    # module.cpu()/inference-mode handling in recent torch/lightning releases.
     def __init__(self, metric='nmi'):
-        super().__init__()
-        self.add_state("pred_labels", default=[], dist_reduce_fx="cat")
-        self.add_state("gt_labels", default=[], dist_reduce_fx="cat")
-        self.add_state("n_videos", default=torch.tensor([0.]), dist_reduce_fx="sum")
         self.metric_fn = score_fn_lookup[metric]
+        self.reset()
+
+    def reset(self):
+        self.pred_labels = []
+        self.gt_labels = []
+        self.n_videos = 0
 
     def update(self, pred_labels, gt_labels, mask):
         self.pred_labels.extend(pred_labels.flatten()[mask.flatten()].tolist())

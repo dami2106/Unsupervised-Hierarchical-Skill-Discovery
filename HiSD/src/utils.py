@@ -2,7 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from scipy.spatial.distance import pdist, squareform
-import wandb
 
 from metrics import pred_to_gt_match, filter_exclusions
 import os

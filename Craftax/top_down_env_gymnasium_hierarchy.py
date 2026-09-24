@@ -1,4 +1,5 @@
 # options_env.py
+import os
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces, error
@@ -6,6 +7,9 @@ from top_down_env_gymnasium import CraftaxTopDownEnv
 
 # IMPORTANT: import the updated helpers
 from option_helpers import (
+    attach_duration_models,
+    skill_start_probabilities,
+    soft_initiation_mask,
     available_skills,
     bc_policy_hierarchy,
     load_all_models_hierarchy,
@@ -48,7 +52,12 @@ class OptionsOnTopEnv(gym.Env):
         pca_model_path: str = 'pca_models/pca_model_750.joblib',
         pu_start_models_dir: str = 'pu_start_models',
         pu_end_models_dir: str = 'pu_end_models',
-
+        # Component C (defaults reproduce the original PU + fixed-horizon behaviour)
+        termination_mode: str = 'pu_horizon',   # pu_horizon | duration | noisy_or | bayes
+        durations_path: str = None,             # HiSD/options/fit_durations.py output (relative to root)
+        duration_cap_quantile: float = 0.95,
+        soft_masks: bool = False,               # initiation probabilities as a logit bias
+        soft_mask_floor: float = 0.02,
     ):
         super().__init__()
         self.env = base_env
@@ -68,6 +77,15 @@ class OptionsOnTopEnv(gym.Env):
             pu_start_models_dir,
             pu_end_models_dir,
         )
+
+        self.soft_masks = bool(soft_masks)
+        self.soft_mask_floor = float(soft_mask_floor)
+        if termination_mode != 'pu_horizon':
+            if durations_path is None:
+                raise ValueError("termination_mode != 'pu_horizon' requires durations_path")
+            path = durations_path if os.path.isabs(durations_path) else os.path.join(root, durations_path)
+            attach_duration_models(self.models, path, mode=termination_mode,
+                                   cap_quantile=duration_cap_quantile, symbol_map=symbol_map)
 
         self.skills = self.models["skills"]
         self.num_options = len(self.skills)
@@ -142,6 +160,12 @@ class OptionsOnTopEnv(gym.Env):
         # No active option: primitives ON, options according to availability
         prim_mask = np.ones(P, dtype=bool)
         frame = self._as_uint8_frame(self.current_obs)
+        if self.soft_masks:
+            # float "mask" = calibrated initiation probability (see HiSD/options/soft_mask_ppo.py)
+            probs = skill_start_probabilities(self.models, frame)
+            idx_map = {s: i for i, s in enumerate(self.models["skills"])}
+            opt_p = soft_initiation_mask([probs[idx_map[s]] for s in self.skills], floor=self.soft_mask_floor)
+            return np.concatenate([prim_mask.astype(np.float32), opt_p], axis=0)
         full_mask = available_skills(self.models, frame)  # aligned to models["skills"]
 
         # Map any internal order to self.skills order (if different)
@@ -236,7 +260,9 @@ class OptionsOnTopEnv(gym.Env):
                 stop = True
             else:
                 skill_name = self.skills[self.active_option_idx]
-                if should_terminate(self.models, self._as_uint8_frame(obs), skill_name, self.active_call_id):
+                elapsed = self._skill_budget(skill_name) - self.option_steps_left
+                if should_terminate(self.models, self._as_uint8_frame(obs), skill_name, self.active_call_id,
+                                    t=elapsed):
                     stop = True
                 elif self.option_steps_left <= 0:
                     stop = True

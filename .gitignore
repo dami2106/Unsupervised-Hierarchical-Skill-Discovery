@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# generated data / experiment outputs
+Craftax/Traces/
+HiSD/runs/
+HiSD/lightning_logs/
+lightning_logs/
+tb_logs_ppo_craftax/
+Craftax/craftax/craftax_classic/assets/texture_cache_classic.pbz2
