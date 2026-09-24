@@ -22,8 +22,13 @@ import logging
 import os
 import sys
 
-# Always use the repository's modified Craftax (Craftax/craftax), never a pip-installed one
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Always use the repository's modified Craftax (Craftax/craftax), never a pip-installed one.
+# block_types.py loads textures by relative path, so also run from this folder; --path is
+# resolved against the caller's working directory.
+_CALLER_CWD = os.getcwd()
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+os.chdir(_HERE)
 
 import jax
 import jax.numpy as jnp
@@ -92,6 +97,7 @@ def main():
     parser.add_argument("--downscale", type=int, default=2,
                         help="integer downscale of the 274x274 top-down image (memory)")
     args = parser.parse_args()
+    args.path = os.path.join(os.path.abspath(os.path.join(_CALLER_CWD, args.path)), "")
 
     for sub in ["groundTruth", "mapping", "top_down_obs", "pixel_obs", "actions"]:
         os.makedirs(os.path.join(args.path, sub), exist_ok=True)
